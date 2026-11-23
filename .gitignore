@@ -1,0 +1,34 @@
+# Local environment variables and credentials
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python environments, caches, and test artifacts
+**/.venv/
+**/venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local databases, logs, and generated output
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Frontend dependencies and generated bundles
+**/node_modules/
+**/dist/
+**/dist-ssr/
+**/*.local
+
+# IDE and operating-system files
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.sw?
