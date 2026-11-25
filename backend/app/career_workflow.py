@@ -151,24 +151,30 @@ def career_workflow_events(request: dict[str, Any]) -> Iterator[dict[str, Any]]:
         stages[name] = {"agent_id": agent_id, "status": state, "message": message}
         return _emit(agent_id, state, message, **extra)
 
-    # STEP 1: Fetch listings once from each configured provider.
-    yield status(1, "working", "Searching configured job sources")
+    # STEP 1: Use listings already returned by the Job Hunter when supplied;
+    # otherwise search the configured providers as part of this same run.
+    yield status(1, "working", "Passing Job Hunter listings to the team" if request.get("jobs") else "Searching configured job sources")
     provider_results = []
     source_errors: dict[str, str] = {}
     jobs: list[dict[str, Any]] = []
-    for source_name, provider in (("Arbeitnow", search_jobs), ("Remotive", search_remote_jobs)):
-        try:
-            result = provider(
-                keyword=keywords,
-                limit=min(limit * 4, 40),
-                **({"preferred_location": preferred_location} if source_name == "Arbeitnow" else {}),
-            )
-            provider_results.append((source_name, result))
-            if result.get("error"):
-                source_errors[source_name] = str(result["error"])
-            jobs.extend(result.get("jobs", []) or [])
-        except Exception as error:  # keep the independent source alive
-            source_errors[source_name] = str(error)
+    supplied_jobs = [job for job in request.get("jobs", []) if isinstance(job, dict)]
+    if supplied_jobs:
+        jobs.extend(supplied_jobs[:limit])
+        provider_results.append(("Job Hunter", {"jobs": jobs}))
+    else:
+        for source_name, provider in (("Arbeitnow", search_jobs), ("Remotive", search_remote_jobs)):
+            try:
+                result = provider(
+                    keyword=keywords,
+                    limit=min(limit * 4, 40),
+                    **({"preferred_location": preferred_location} if source_name == "Arbeitnow" else {}),
+                )
+                provider_results.append((source_name, result))
+                if result.get("error"):
+                    source_errors[source_name] = str(result["error"])
+                jobs.extend(result.get("jobs", []) or [])
+            except Exception as error:  # keep the independent source alive
+                source_errors[source_name] = str(error)
 
     unique_jobs: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -176,7 +182,7 @@ def career_workflow_events(request: dict[str, Any]) -> Iterator[dict[str, Any]]:
         if not isinstance(job, dict) or not job.get("title") or not job.get("url"):
             continue
         url = str(job["url"]).strip()
-        if url in seen or not _matches_location(job, preferred_location) or not _matches_job_type(job, requested_type):
+        if url in seen or (not supplied_jobs and (not _matches_location(job, preferred_location) or not _matches_job_type(job, requested_type))):
             continue
         seen.add(url)
         unique_jobs.append(job)

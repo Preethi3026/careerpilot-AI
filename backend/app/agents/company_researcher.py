@@ -579,7 +579,7 @@ Keep the response concise and professional.
 
     try:
 
-        result = get_ai_response(prompt)
+        result = get_ai_response(prompt, think=True, timeout=900)
 
         if result and result.strip():
             return result

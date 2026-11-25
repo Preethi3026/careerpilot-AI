@@ -1,9 +1,9 @@
 import json
 import os
 import uuid
-from typing import Literal
+from typing import Any, Literal
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 from starlette.responses import FileResponse, StreamingResponse
@@ -20,12 +20,13 @@ from app.agents.company_researcher import research_company
 
 from app.agents.application_manager import (
     add_application,
+    get_connection,
     get_applications,
     update_application,
     get_application_stats
 )
 from app.agents.career_storage import (
-    get_candidate_profile as load_candidate_profile,
+    get_candidate_profile as load_candidate_profile_db,
     get_generated_document,
     attach_workflow_documents,
     claim_workflow_run,
@@ -35,8 +36,20 @@ from app.agents.career_storage import (
     fail_interrupted_workflow_runs,
     get_workflow_history,
     list_workflow_history,
-    save_candidate_profile,
     save_workflow_result,
+)
+from app.jobs.profile import (
+    apply_profile_fixes,
+    extract_and_save_profile,
+    fetch_public_github_projects,
+    get_preferences,
+    load_candidate_profile_file,
+    load_github_projects,
+    load_profile,
+    read_master_cv_text,
+    save_candidate_profile_file,
+    save_preferences,
+    upload_master_cv as store_master_cv,
 )
 
 from app.agents.project_intelligence import recommend_projects
@@ -171,6 +184,16 @@ class CandidateProfileRequest(BaseModel):
     preferred_location: str = Field(default="Germany", max_length=300)
     preferred_job_type: str = Field(default="internship", max_length=100)
     career_goals: str = Field(default="", max_length=5000)
+    github_username: str | None = Field(default=None, max_length=100)
+
+
+class ResumeFactsTextRequest(BaseModel):
+    resume_text: str = Field(min_length=40, max_length=30000)
+    source: str = "saved-profile"
+
+
+class GitHubProfileRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
 
 
 class ProjectIntelligenceRequest(BaseModel):
@@ -199,6 +222,7 @@ class CareerWorkflowRequest(BaseModel):
     job_description: str = ""
     job_url: str = ""
     company_url: str = ""
+    jobs: list[dict[str, object]] = Field(default_factory=list, max_length=50)
 
     @model_validator(mode="after")
     def require_candidate_profile_for_search(self):
@@ -236,13 +260,91 @@ def health():
 
 @app.get("/api/profile")
 def read_candidate_profile():
-    stored = load_candidate_profile()
-    return {"profile": stored["profile"] if stored else None, "updated_at": stored["updated_at"] if stored else None}
+    stored = load_candidate_profile_file()
+    if not stored:
+        # Move the legacy profile out of SQLite once, preserving its update
+        # timestamp so restoring an earlier run doesn't start a new search.
+        legacy = load_candidate_profile_db()
+        if legacy:
+            stored = save_candidate_profile_file(legacy["profile"], legacy["updated_at"])
+            with get_connection() as connection:
+                connection.execute("DELETE FROM candidate_profile WHERE id = 1")
+    if stored:
+        return {"profile": stored["profile"], "updated_at": stored["updated_at"]}
+    master_text = read_master_cv_text()
+    if master_text:
+        return {"profile": {"full_name": "", "email": "", "phone": "", "resume_text": master_text, "skills": "", "education": "", "university": "", "experience": "", "projects": "", "certifications": "", "languages": "", "preferred_job_titles": "AI / Data Intern", "preferred_location": "Germany", "preferred_job_type": "internship", "career_goals": "", "github_username": ""}, "updated_at": None}
+    return {"profile": None, "updated_at": None}
 
 
 @app.put("/api/profile")
 def write_candidate_profile(request: CandidateProfileRequest):
-    return save_candidate_profile(request.model_dump())
+    return save_candidate_profile_file(request.model_dump(exclude_unset=True))
+
+
+@app.get("/api/profile/facts")
+def read_profile_facts():
+    profile = load_profile()
+    if profile is None:
+        candidate = read_candidate_profile()["profile"]
+        if candidate and candidate.get("resume_text", "").strip():
+            profile = extract_and_save_profile(candidate["resume_text"], "saved-profile")["profile"]
+    return {"profile": profile}
+
+
+@app.post("/api/profile/facts")
+def create_profile_facts(request: ResumeFactsTextRequest):
+    return extract_and_save_profile(request.resume_text, request.source)
+
+
+@app.patch("/api/profile/facts")
+def update_profile_facts(request: dict[str, Any]):
+    try:
+        return apply_profile_fixes(request)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.post("/api/profile/master-cv")
+async def upload_master_cv(file: UploadFile = File(...)):
+    content = await file.read(15 * 1024 * 1024 + 1)
+    try:
+        return store_master_cv(file.filename or "master_cv.pdf", content)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    finally:
+        await file.close()
+
+
+@app.get("/api/profile/preferences")
+def read_profile_preferences():
+    return {"preferences": get_preferences()}
+
+
+@app.put("/api/profile/preferences")
+def write_profile_preferences(request: dict[str, Any]):
+    try:
+        return save_preferences(request)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.get("/api/profile/github")
+def read_github_projects():
+    return {"catalogue": load_github_projects()}
+
+
+@app.post("/api/profile/github")
+def fetch_github_projects(request: GitHubProfileRequest):
+    try:
+        result = fetch_public_github_projects(request.username)
+        candidate = read_candidate_profile()["profile"]
+        if candidate:
+            candidate["github_username"] = result["username"]
+            save_candidate_profile_file(candidate)
+        return result
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @app.get("/api/workflow-history")

@@ -89,6 +89,7 @@ export type SavedCandidateProfile = {
   preferred_location: string;
   preferred_job_type: string;
   career_goals: string;
+  github_username: string;
 };
 
 export function getCandidateProfile() {
@@ -101,6 +102,51 @@ export function saveCandidateProfile(profile: SavedCandidateProfile) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(profile),
   });
+}
+
+export function getProfileFacts() {
+  return request<{ profile: Record<string, any> | null }>("/api/profile/facts");
+}
+
+export function createProfileFacts(resume_text: string, source = "saved-profile") {
+  return callAgent<{ profile: Record<string, any>; file: string; facts_file: string }>("/api/profile/facts", { resume_text, source });
+}
+
+export function fixProfileFacts(changes: Record<string, unknown>) {
+  return request<{ profile: Record<string, any>; file: string; facts_file: string; changed: string[]; new_ids: string[] }>("/api/profile/facts", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(changes),
+  });
+}
+
+export function uploadMasterCV(file: File) {
+  const form = new FormData();
+  form.append("file", file);
+  return request<{ profile: Record<string, any>; resume_text: string; file: string; facts_file: string }>("/api/profile/master-cv", {
+    method: "POST",
+    body: form,
+  });
+}
+
+export function getProfilePreferences() {
+  return request<{ preferences: Record<string, any> }>("/api/profile/preferences");
+}
+
+export function saveProfilePreferences(preferences: Record<string, any>) {
+  return request<{ preferences: Record<string, any>; file: string }>("/api/profile/preferences", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(preferences),
+  });
+}
+
+export function getGitHubProjects() {
+  return request<{ catalogue: Record<string, any> | null }>("/api/profile/github");
+}
+
+export function fetchGitHubProjects(username: string) {
+  return callAgent<{ username: string; repos: number; projects: Record<string, any>[]; file: string }>("/api/profile/github", { username });
 }
 
 export function getWorkflowHistory() {
@@ -151,6 +197,8 @@ export type CareerWorkflowPayload = {
   certifications?: string;
   languages?: string;
   career_goals?: string;
+  github_username?: string;
+  jobs?: Record<string, any>[];
 };
 
 export type CareerWorkflowEvent = {

@@ -561,7 +561,7 @@ OUTPUT FORMAT:
 Prioritise accuracy, practical learning and career relevance.
 """
 
-    ai_recommendations = get_ai_response(prompt)
+    ai_recommendations = get_ai_response(prompt, think=True, timeout=900)
 
     return {
         "agent": "Project Intelligence",

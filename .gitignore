@@ -20,6 +20,9 @@ htmlcov/
 backend/generated_documents/
 backend/uploads/
 backend/tmp/
+backend/data/jobs/
+backend/output/
+reference/
 
 # Frontend dependencies and generated bundles
 **/node_modules/

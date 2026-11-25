@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
 import OfficeScene, { type OfficeAgent } from "./OfficeScene";
-import { callAgent as postAgent, checkBackend, createApplication, getApplications, getCandidateProfile, getDocumentUrl, getWorkflowHistory, getWorkflowHistoryItem, getWorkflowRunStatus, saveCandidateProfile, sendAgentChat, streamCareerWorkflow, updateApplication, type CareerWorkflowEvent, type CareerWorkflowPayload, type SavedCandidateProfile } from "./services/api";
+import { callAgent as postAgent, checkBackend, createApplication, createProfileFacts, fetchGitHubProjects, fixProfileFacts, getApplications, getCandidateProfile, getDocumentUrl, getGitHubProjects, getProfileFacts, getProfilePreferences, getWorkflowHistory, getWorkflowHistoryItem, getWorkflowRunStatus, saveCandidateProfile, saveProfilePreferences, sendAgentChat, streamCareerWorkflow, updateApplication, uploadMasterCV, type CareerWorkflowEvent, type CareerWorkflowPayload, type SavedCandidateProfile } from "./services/api";
 
 type Agent = {
   id: number;
@@ -54,6 +54,52 @@ type CareerWorkflowResult = {
   errors: Array<{ agent: string; message: string }>;
   summary: Record<string, number>;
 };
+
+type ProfileFactRow = { key: string; id: string; label: string; text: string; field?: string; fact: boolean };
+
+const defaultProfilePreferences: Record<string, any> = {
+  location: "Germany",
+  target_roles: ["Machine Learning Intern", "AI Intern", "Data Engineering Intern", "Praktikum Machine Learning", "Praktikum Künstliche Intelligenz", "Praktikum Data Engineering"],
+  seniority: ["internship"], languages: [], availability: "", mandatory_internship: false,
+  search: { queries: ["Machine Learning Intern", "AI Intern", "Data Engineering Intern", "Praktikum Machine Learning", "Praktikum Künstliche Intelligenz", "Praktikum Data Engineering"], location: "Germany", job_types: ["internship"] },
+  automation: { min_fit: 70, max_drafts_per_run: 3, max_matches_per_run: 12, min_keyword_score: 40 },
+};
+
+function profileFactRows(profile: Record<string, any> | null): ProfileFactRow[] {
+  if (!profile) return [];
+  const rows: ProfileFactRow[] = [];
+  const addFact = (fact: Record<string, any>, group: string) => rows.push({ key: fact.id, id: fact.id, label: group, text: String(fact.text || ""), fact: true });
+  const addField = (entry: Record<string, any>, field: string, label: string, group: string) => {
+    if (entry[field] !== undefined) rows.push({ key: `${entry.id}.${field}`, id: entry.id, field, label: `${group} · ${label}`, text: Array.isArray(entry[field]) ? entry[field].join(" | ") : String(entry[field]), fact: false });
+  };
+  addField({ id: "header", ...profile.header, contact: (profile.header?.contact || []).join(" | ") }, "name", "Name", "Header");
+  addField({ id: "header", ...profile.header, contact: (profile.header?.contact || []).join(" | ") }, "headline", "Headline", "Header");
+  addField({ id: "header", ...profile.header, contact: (profile.header?.contact || []).join(" | ") }, "contact", "Contact", "Header");
+  for (const fact of profile.summary || []) addFact(fact, "Summary");
+  for (const skill of profile.skills || []) {
+    addField(skill, "label", "Group", skill.id);
+    addField(skill, "items", "Skills", skill.id);
+  }
+  for (const entry of profile.experience || []) {
+    addField(entry, "title", "Role", entry.id);
+    addField(entry, "org", "Organization", entry.id);
+    addField(entry, "dates", "Dates", entry.id);
+    for (const fact of entry.bullets || []) addFact(fact, `${entry.id} · ${entry.title || "Experience"}`);
+  }
+  for (const project of profile.projects || []) {
+    addField(project, "name", "Project", project.id);
+    addField(project, "tagline", "Description", project.id);
+    for (const fact of project.bullets || []) addFact(fact, `${project.id} · ${project.name || "Project"}`);
+  }
+  for (const entry of profile.education || []) {
+    addField(entry, "degree", "Degree", entry.id);
+    addField(entry, "school", "Institution", entry.id);
+    addField(entry, "dates", "Dates", entry.id);
+    addField(entry, "note", "Details", entry.id);
+  }
+  for (const section of ["certifications", "languages"]) for (const fact of profile[section] || []) addFact(fact, section === "certifications" ? "Certification" : "Language");
+  return rows;
+}
 
 const agentWorkflowSteps: Record<number, string[]> = {
   1: ["Fetch job listings", "Remove duplicates", "Keep Germany or remote roles", "Check AI, data, and software fit", "Check junior and internship fit", "Score skills and rank results"],
@@ -265,8 +311,17 @@ function App() {
     job_type: "internship",
     limit: 3,
     company_url: "",
+    github_username: "",
   });
   const [resumeFileName, setResumeFileName] = useState("");
+  const [factProfile, setFactProfile] = useState<Record<string, any> | null>(null);
+  const [factEdits, setFactEdits] = useState<Record<string, string>>({});
+  const [newSummaryFact, setNewSummaryFact] = useState("");
+  const [factStatus, setFactStatus] = useState("");
+  const [jobPreferences, setJobPreferences] = useState<Record<string, any>>(defaultProfilePreferences);
+  const [preferencesStatus, setPreferencesStatus] = useState("");
+  const [githubProjects, setGithubProjects] = useState<Record<string, any>[]>([]);
+  const [githubStatus, setGithubStatus] = useState("");
   const [resumeImportError, setResumeImportError] = useState("");
   const [copiedDocument, setCopiedDocument] = useState("");
   const [profileSaveMessage, setProfileSaveMessage] = useState("");
@@ -339,7 +394,7 @@ function App() {
       while (!cancelled) {
         try {
           await checkBackend();
-          const [saved, history] = await Promise.all([getCandidateProfile(), getWorkflowHistory()]);
+          const [saved, history, facts, preferences, projects] = await Promise.all([getCandidateProfile(), getWorkflowHistory(), getProfileFacts(), getProfilePreferences(), getGitHubProjects()]);
           if (cancelled) return;
           setBackendConnected(true);
           if (saved.profile) {
@@ -362,8 +417,12 @@ function App() {
               certifications: profile.certifications,
               languages: profile.languages,
               career_goals: profile.career_goals,
+              github_username: profile.github_username || "",
             }));
           }
+          setFactProfile(facts.profile);
+          setJobPreferences({ ...defaultProfilePreferences, ...preferences.preferences, search: { ...defaultProfilePreferences.search, ...(preferences.preferences?.search || {}) }, automation: { ...defaultProfilePreferences.automation, ...(preferences.preferences?.automation || {}) } });
+          setGithubProjects(projects.catalogue?.projects || []);
           setWorkflowHistory(history.workflows);
           setProfileLoaded(true);
           if (!saved.profile) setCareerAssistantOpen(true);
@@ -490,7 +549,59 @@ function App() {
       certifications: form.certifications || "", languages: form.languages || "",
       preferred_job_titles: form.keyword, preferred_location: form.preferred_location,
       preferred_job_type: form.job_type, career_goals: form.career_goals || "",
+      github_username: form.github_username || "",
     };
+  }
+
+  async function saveProfileFactEdits(removeId?: string) {
+    const rows = profileFactRows(factProfile);
+    const set = rows.filter((row) => Object.prototype.hasOwnProperty.call(factEdits, row.key) && factEdits[row.key] !== row.text).map((row) => row.fact
+      ? { id: row.id, text: factEdits[row.key] }
+      : row.id === "header" ? { id: row.id, field: row.field, value: factEdits[row.key] }
+        : { id: row.id, field: row.field, value: factEdits[row.key] });
+    const add = newSummaryFact.trim() ? [{ to: "summary", text: newSummaryFact.trim() }] : [];
+    const changes: Record<string, unknown> = { set, add };
+    if (removeId) changes.remove = [removeId];
+    if (!set.length && !add.length && !removeId) {
+      setFactStatus("Edit a fact or add a summary fact first.");
+      return;
+    }
+    try {
+      const saved = await fixProfileFacts(changes);
+      setFactProfile(saved.profile);
+      setFactEdits({});
+      setNewSummaryFact("");
+      setFactStatus(`Saved profile version ${saved.profile.version} · ${saved.facts_file}`);
+    } catch (saveError) {
+      setFactStatus(saveError instanceof Error ? saveError.message : "Could not save the fact correction.");
+    }
+  }
+
+  async function saveJobPreferences() {
+    try {
+      const saved = await saveProfilePreferences(jobPreferences);
+      setJobPreferences(saved.preferences);
+      setPreferencesStatus(`Saved ${saved.file}`);
+    } catch (saveError) {
+      setPreferencesStatus(saveError instanceof Error ? saveError.message : "Could not save job preferences.");
+    }
+  }
+
+  async function fetchCandidateGitHub() {
+    const username = (careerForm.github_username || "").trim();
+    if (!username) {
+      setGithubStatus("Enter your GitHub username first.");
+      return;
+    }
+    setGithubStatus("Reading public repositories and READMEs…");
+    try {
+      const fetched = await fetchGitHubProjects(username);
+      setGithubProjects(fetched.projects);
+      setGithubStatus(`Saved ${fetched.repos} public repositories as project facts in ${fetched.file}.`);
+      setCareerForm((previous) => ({ ...previous, github_username: fetched.username }));
+    } catch (fetchError) {
+      setGithubStatus(fetchError instanceof Error ? fetchError.message : "Could not fetch public GitHub repositories.");
+    }
   }
 
   async function persistCandidateProfile() {
@@ -598,10 +709,11 @@ function App() {
     }
   }
 
-  async function startCareerWorkflow(event?: React.FormEvent<HTMLFormElement>, automatic = false, suppliedExecutionKey?: string) {
+  async function startCareerWorkflow(event?: React.FormEvent<HTMLFormElement>, automatic = false, suppliedExecutionKey?: string, payloadOverride?: CareerWorkflowPayload) {
     event?.preventDefault();
     if (careerLoading) return;
-    if (careerForm.resume_text.trim().length < 40) {
+    const workflowPayload = payloadOverride || careerForm;
+    if (workflowPayload.resume_text.trim().length < 40) {
       setCareerError("Complete your saved candidate profile before starting an automated search.");
       return;
     }
@@ -616,7 +728,7 @@ function App() {
     try {
       if (!automatic) {
         try {
-          const saved = await saveCandidateProfile(getProfilePayload());
+          const saved = await saveCandidateProfile(getProfilePayload(workflowPayload));
           savedProfileUpdatedAt.current = saved.updated_at;
           localStorage.setItem(`careerpilot:auto-workflow:${saved.updated_at}`, executionKey);
           autoStartClaimed.current = true;
@@ -625,7 +737,7 @@ function App() {
           setProfileSaveMessage(saveError instanceof Error ? `PROFILE SAVE FAILED · ${saveError.message}` : "PROFILE SAVE FAILED");
         }
       }
-      const result = await streamCareerWorkflow(careerForm, (update) => {
+      const result = await streamCareerWorkflow(workflowPayload, (update) => {
         setCareerProgress((previous) => [...previous, update]);
         if (update.agent_id) {
           const status = update.status === "completed" ? "completed"
@@ -703,6 +815,31 @@ function App() {
         setResumeImportError("No readable text was found. If this is a scanned PDF, paste its text into the box instead.");
         return;
       }
+      let parsedFacts: Record<string, any> | null = null;
+      if (extension === "pdf") {
+        try {
+          const uploaded = await uploadMasterCV(file);
+          parsedFacts = uploaded.profile;
+          setFactStatus(`Saved ${uploaded.file} and generated ${uploaded.facts_file}.`);
+        } catch (uploadError) {
+          try {
+            const extracted = await createProfileFacts(text.trim(), "uploaded-resume.pdf");
+            parsedFacts = extracted.profile;
+            setFactStatus(`Used text fallback; PDF storage failed: ${uploadError instanceof Error ? uploadError.message : "upload failed"}`);
+          } catch (factError) {
+            setFactStatus(factError instanceof Error ? factError.message : "Could not create numbered facts.");
+          }
+        }
+      } else {
+        try {
+          const extracted = await createProfileFacts(text.trim(), `uploaded-resume.${extension}`);
+          parsedFacts = extracted.profile;
+          setFactStatus(`Generated numbered facts in ${extracted.facts_file}.`);
+        } catch (factError) {
+          setFactStatus(factError instanceof Error ? factError.message : "Could not create numbered facts.");
+        }
+      }
+      if (parsedFacts) setFactProfile(parsedFacts);
       setCareerForm((previous) => ({ ...previous, resume_text: text.trim() }));
       setResumeFileName(file.name);
     } catch (importError) {
@@ -730,6 +867,22 @@ function App() {
     } catch (statusError) {
       setError(statusError instanceof Error ? statusError.message : "Could not update this application status.");
     }
+  }
+
+  async function continueHunterJobs() {
+    const jobs = Array.isArray((result as any)?.jobs) ? (result as any).jobs as Record<string, any>[] : [];
+    if (!jobs.length) return;
+    const workflowPayload: CareerWorkflowPayload = {
+      ...careerForm,
+      keyword: formValues.keyword || careerForm.keyword,
+      limit: Math.min(10, jobs.length),
+      jobs,
+    };
+    setSelectedAgent(null);
+    setCareerAssistantOpen(true);
+    setCareerError("");
+    setCareerProgress([]);
+    await startCareerWorkflow(undefined, false, undefined, workflowPayload);
   }
 
   function closeAgent() {
@@ -783,6 +936,22 @@ function App() {
 
       const payload: Record<string, unknown> = { ...formValues };
 
+      // Starting Job Hunter launches the complete single-run workflow. The
+      // CareerWorkflow's Hunter stage searches, then the other stages continue.
+      if (selectedAgent.id === 1) {
+        const workflowPayload: CareerWorkflowPayload = {
+          ...careerForm,
+          keyword: formValues.keyword || careerForm.keyword,
+          limit: Math.min(10, Math.max(1, Number(formValues.limit || careerForm.limit))),
+        };
+        setSelectedAgent(null);
+        setCareerAssistantOpen(true);
+        setCareerError("");
+        setCareerProgress([]);
+        await startCareerWorkflow(undefined, false, undefined, workflowPayload);
+        return;
+      }
+
       // Application Manager
       if (selectedAgent.id === 7) {
         const data = await getApplications();
@@ -817,8 +986,10 @@ function App() {
       addActivity(`${selectedAgent.name} encountered an error`);
     } finally {
       setLoading(false);
-      setSceneStatus((previous) => ({ ...previous, [selectedAgent.id]: "chatting" }));
-      setSceneStation((previous) => ({ ...previous, [selectedAgent.id]: "desk" }));
+      if (selectedAgent.id !== 1) {
+        setSceneStatus((previous) => ({ ...previous, [selectedAgent.id]: "chatting" }));
+        setSceneStation((previous) => ({ ...previous, [selectedAgent.id]: "desk" }));
+      }
     }
   }
 
@@ -1116,12 +1287,42 @@ function App() {
                       <label>Certifications<textarea rows={2} value={careerForm.certifications || ""} onChange={(event) => setCareerForm((previous) => ({ ...previous, certifications: event.target.value }))} /></label>
                       <label>Languages<textarea rows={2} value={careerForm.languages || ""} onChange={(event) => setCareerForm((previous) => ({ ...previous, languages: event.target.value }))} /></label>
                       <label>Career goals<textarea rows={2} value={careerForm.career_goals || ""} onChange={(event) => setCareerForm((previous) => ({ ...previous, career_goals: event.target.value }))} /></label>
+                      <label>GitHub username<input value={careerForm.github_username || ""} onChange={(event) => setCareerForm((previous) => ({ ...previous, github_username: event.target.value }))} placeholder="Your public username" /></label>
+                      <button type="button" onClick={() => void fetchCandidateGitHub()}>FETCH PUBLIC GITHUB PROJECTS</button>
+                      {githubStatus && <small role="status">{githubStatus}</small>}
+                      {githubProjects.length > 0 && <details><summary>GitHub project facts · {githubProjects.length}</summary>{githubProjects.map((project) => <p key={project.id}><strong>{project.id} · {project.name}</strong> — {project.summary || "No repository description"}<br /><small>{(project.stack || []).join(", ")}</small></p>)}</details>}
                     </div>
+                  </details>
+                  <details className="career-section profile-extra-fields">
+                    <summary>Numbered CV facts {factProfile ? `· profile v${factProfile.version}` : ""}</summary>
+                    <p>Review and correct the facts extracted from your master CV. Earlier profile versions are kept.</p>
+                    {profileFactRows(factProfile).map((row) => <label className="profile-fact-row" key={row.key}><span><strong>{row.id}</strong> · {row.label}</span><input value={Object.prototype.hasOwnProperty.call(factEdits, row.key) ? factEdits[row.key] : row.text} onChange={(event) => setFactEdits((previous) => ({ ...previous, [row.key]: event.target.value }))} />{row.fact && <button type="button" onClick={() => void saveProfileFactEdits(row.id)}>REMOVE</button>}</label>)}
+                    {!factProfile && <p>Upload a master CV or import resume text to create numbered facts.</p>}
+                    <label>Add a summary fact<textarea rows={2} value={newSummaryFact} onChange={(event) => setNewSummaryFact(event.target.value)} placeholder="Add a verified summary sentence" /></label>
+                    <button type="button" onClick={() => void saveProfileFactEdits()}>SAVE FACT CORRECTIONS</button>
+                    {factStatus && <p role="status">{factStatus}</p>}
+                  </details>
+                  <details className="career-section profile-extra-fields">
+                    <summary>Job search preferences</summary>
+                    <label>Search queries (one per line)
+                      <textarea rows={5} value={(jobPreferences.search?.queries || []).join("\n")} onChange={(event) => { const queries = event.target.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 6); setJobPreferences((previous) => ({ ...previous, target_roles: queries, search: { ...previous.search, queries } })); }} />
+                    </label>
+                    <label>Search location<input value={jobPreferences.location || "Germany"} onChange={(event) => setJobPreferences((previous) => ({ ...previous, location: event.target.value, search: { ...previous.search, location: event.target.value } }))} /></label>
+                    <label>Languages and level (one per line, e.g. German:B2)
+                      <textarea rows={2} value={(jobPreferences.languages || []).map((item: any) => `${item.language}:${item.level}`).join("\n")} onChange={(event) => { const languages = event.target.value.split(/\r?\n/).map((line) => { const [language, level] = line.split(":"); return { language: (language || "").trim(), level: (level || "").trim() }; }).filter((item) => item.language && item.level); setJobPreferences((previous) => ({ ...previous, languages })); }} />
+                    </label>
+                    <label>Availability<input value={jobPreferences.availability || ""} onChange={(event) => setJobPreferences((previous) => ({ ...previous, availability: event.target.value }))} placeholder="Optional; leave blank if unknown" /></label>
+                    <label><input type="checkbox" checked={Boolean(jobPreferences.mandatory_internship)} onChange={(event) => setJobPreferences((previous) => ({ ...previous, mandatory_internship: event.target.checked }))} /> My study program requires an internship</label>
+                    <div className="career-intake-grid">
+                      {([["min_fit", "Minimum fit"], ["max_drafts_per_run", "Maximum drafts per run"], ["max_matches_per_run", "Maximum matches per run"], ["min_keyword_score", "Minimum keyword score"]] as [string, string][]).map(([key, label]) => <label key={key}>{label}<input type="number" value={jobPreferences.automation?.[key] ?? defaultProfilePreferences.automation[key]} onChange={(event) => setJobPreferences((previous) => ({ ...previous, automation: { ...previous.automation, [key]: Number(event.target.value) } }))} /></label>)}
+                    </div>
+                    <button type="button" onClick={() => void saveJobPreferences()}>SAVE JOB PREFERENCES</button>
+                    {preferencesStatus && <p role="status">{preferencesStatus}</p>}
                   </details>
                 </div>
                 <div className="career-profile-actions">
                   <button type="button" onClick={() => void persistCandidateProfile()} disabled={!careerForm.resume_text.trim()}>{profileSaveMessage || "SAVE CANDIDATE PROFILE"}</button>
-                  <span>Saved locally in your CareerPilot database · loaded automatically next time</span>
+                  <span>Candidate profile is stored locally under backend/data/jobs/me.</span>
                 </div>
                 <button type="submit" className="career-start-button">✦ START CAREER ANALYSIS</button>
               </form>
@@ -1484,7 +1685,7 @@ function App() {
                 >
                   {loading
                     ? "⏳ YOUR AGENT IS WORKING..."
-                    : "🚀 START WORKING →"}
+                    : selectedAgent.id === 1 ? "🚀 START FULL JOB-TO-DOCUMENT WORKFLOW →" : "🚀 START WORKING →"}
                 </button>
 
               </>
@@ -1696,6 +1897,15 @@ function App() {
                           )}
 
                         </div>
+
+                        <button
+                          type="button"
+                          style={{ ...actionButtonStyle, marginTop: "18px" }}
+                          onClick={() => void continueHunterJobs()}
+                          disabled={loading || careerLoading}
+                        >
+                          📄 GENERATE CUSTOM CV + COVER LETTERS FOR THESE JOBS
+                        </button>
 
                       </>
 
