@@ -6,10 +6,31 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app.agents import application_manager
+from app.agents import career_storage
 from app.main import app
 
 
 class CareerStorageTests(unittest.TestCase):
+    def test_generated_pdf_is_valid_and_downloaded_by_opaque_id(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(application_manager, "DATABASE", Path(folder) / "careerpilot.db"), \
+             patch.object(career_storage, "GENERATED_DIR", Path(folder) / "generated_documents"):
+            document = career_storage.create_document_pdf(
+                "Candidate Name\nPython and machine learning experience.",
+                "AI Engineer Intern", "Example Labs", "resume",
+            )
+            duplicate = career_storage.create_document_pdf(
+                "Candidate Name\nPython and machine learning experience.",
+                "AI Engineer Intern", "Example Labs", "resume",
+            )
+            response = TestClient(app).get(document["download_url"])
+            missing = TestClient(app).get("/api/documents/../../outside")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "application/pdf")
+        self.assertTrue(response.content.startswith(b"%PDF-"))
+        self.assertEqual(document["id"], duplicate["id"])
+        self.assertEqual(missing.status_code, 404)
+
     def test_candidate_profile_survives_api_round_trip(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(application_manager, "DATABASE", Path(folder) / "careerpilot.db"):
             client = TestClient(app)

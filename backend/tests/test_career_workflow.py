@@ -29,6 +29,21 @@ class CareerWorkflowTests(unittest.TestCase):
             "source": "TEST FIXTURE (not a live listing)",
         }
 
+    def test_candidate_resume_alone_parses_without_optional_experience_field(self):
+        profile = workflow._candidate_profile({
+            "resume_text": "MSc student with 2 years of experience using Python and SQL. Projects: AgentEval.",
+        })
+
+        self.assertIn("Python", profile["skills"])
+        self.assertEqual(profile["experience_years"], 2)
+        self.assertEqual(profile["experience_provided"], "")
+        self.assertEqual(profile["projects"], [])
+
+    def test_match_threshold_accepts_80_and_rejects_79(self):
+        self.assertTrue(workflow._is_suitable({}, {"match_score": 80}, "any"))
+        self.assertFalse(workflow._is_suitable({}, {"match_score": 79}, "any"))
+        self.assertFalse(workflow._is_suitable({}, {"match_score": 0}, "any"))
+
     def test_ai_ml_fixture_completes_all_agents_and_handoffs(self):
         second_job = {
             **self.job,
@@ -55,6 +70,7 @@ class CareerWorkflowTests(unittest.TestCase):
             patch.object(workflow, "review_application", wraps=workflow.review_application) as reviewer,
             patch.object(workflow, "get_applications", return_value=[]) as tracker,
             patch.object(workflow, "get_application_stats", return_value={"total_applications": 0}),
+            patch.object(workflow, "add_application", return_value={"id": 1, "duplicate": False, "status": "Ready to Apply"}),
             patch.object(workflow, "recommend_projects", wraps=workflow.recommend_projects) as projects,
         ):
             events = list(workflow.career_workflow_events(self.request))
@@ -77,7 +93,7 @@ class CareerWorkflowTests(unittest.TestCase):
             {(self.job["company"], self.job["title"], "https://fixture.invalid/company"), (second_job["company"], second_job["title"], "https://fixture.invalid/company")},
         )
         self.assertEqual(reviewer.call_count, 2)
-        tracker.assert_called_once()
+        self.assertEqual(tracker.call_count, 2)
         projects.assert_called_once()
 
         self.assertEqual(events[-1]["type"], "result")
@@ -90,14 +106,14 @@ class CareerWorkflowTests(unittest.TestCase):
             self.assertTrue(item["company_research"])
             self.assertIn("Fixture verified report", item["company_research"])
             self.assertTrue(item["review"])
-            self.assertEqual(item["tracking"]["status"], "Ready to save")
+            self.assertEqual(item["tracking"]["status"], "Ready to Apply")
         for call, item in zip(cover_agent.call_args_list, result["selected_jobs"]):
             self.assertEqual(call.args[3], item["resume"])
         for call, item in zip(reviewer.call_args_list, result["selected_jobs"]):
             self.assertEqual(call.args[1], item["resume"])
             self.assertEqual(call.args[2], item["cover_letter"])
             self.assertEqual(call.args[3], item["company_research"])
-        self.assertFalse(result["application_tracking"]["records_changed"])
+        self.assertTrue(result["application_tracking"]["records_changed"])
         self.assertTrue(result["project_intelligence"])
         self.assertTrue(all(stage["status"] == "completed" for stage in result["stages"].values()))
 
@@ -130,7 +146,7 @@ class CareerWorkflowTests(unittest.TestCase):
         self.assertTrue(rejected_match["match"]["seniority_mismatch"])
         self.assertIn("Senior", rejected_match["match"]["job_level"])
         self.assertFalse(rejected_match["suitable"])
-        self.assertTrue(any("seniority" in reason for reason in rejected_match["rejection_reasons"]))
+        self.assertTrue(any("80%" in reason for reason in rejected_match["rejection_reasons"]))
         self.assertEqual(result["summary"]["documents_completed"], 0)
 
     def test_zero_jobs_and_invalid_job_description_are_reported_without_crashing(self):
@@ -204,6 +220,7 @@ class CareerWorkflowTests(unittest.TestCase):
     @patch.object(workflow, "recommend_projects", return_value={})
     @patch.object(workflow, "get_application_stats", return_value={})
     @patch.object(workflow, "get_applications", return_value=[])
+    @patch.object(workflow, "add_application", return_value={"id": 1, "duplicate": False, "status": "Suitable"})
     @patch.object(workflow, "review_application", return_value="Review continued")
     @patch.object(workflow, "research_company", return_value="Research continued")
     @patch.object(workflow, "generate_cover_letter")
@@ -233,6 +250,26 @@ class CareerWorkflowTests(unittest.TestCase):
         self.assertEqual([event["type"] for event in decoded], ["progress", "result"])
         self.assertIn("selected_jobs", decoded[-1]["data"])
 
+    def test_stream_idempotency_key_replays_completed_run_without_restarting_agents(self):
+        import json
+        from pathlib import Path
+        from app.agents import application_manager
+
+        events = [
+            {"type": "progress", "agent_id": 1, "agent": "Job Hunter", "status": "working", "message": "Searching"},
+            {"type": "result", "data": {"keyword": "test", "summary": {}, "selected_jobs": [], "errors": []}},
+        ]
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(application_manager, "DATABASE", Path(folder) / "careerpilot.db"), \
+             patch("app.main.career_workflow_events", return_value=iter(events)) as execute:
+            client = TestClient(app)
+            first = client.post("/api/career-workflow/stream", json=self.request, headers={"Idempotency-Key": "profile-version-test"})
+            second = client.post("/api/career-workflow/stream", json=self.request, headers={"Idempotency-Key": "profile-version-test"})
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(execute.call_count, 1)
+        self.assertEqual(json.loads(first.text.splitlines()[-1]), json.loads(second.text.splitlines()[-1]))
+
     def test_stream_endpoint_completes_ai_ml_fixture_pipeline(self):
         with (
             patch.object(workflow, "search_jobs", return_value={"jobs": [{**self.job, "company_url": "https://fixture.invalid/company"}]}),
@@ -245,6 +282,7 @@ class CareerWorkflowTests(unittest.TestCase):
             patch("app.agents.company_researcher.generate_research_report", return_value="Fixture verified report"),
             patch.object(workflow, "get_applications", return_value=[]),
             patch.object(workflow, "get_application_stats", return_value={"total_applications": 0}),
+            patch.object(workflow, "add_application", return_value={"id": 1, "duplicate": False, "status": "Ready to Apply"}),
         ):
             response = TestClient(app).post("/api/career-workflow/stream", json=self.request)
 

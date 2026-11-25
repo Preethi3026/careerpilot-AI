@@ -17,6 +17,9 @@ htmlcov/
 *.sqlite
 *.sqlite3
 *.log
+backend/generated_documents/
+backend/uploads/
+backend/tmp/
 
 # Frontend dependencies and generated bundles
 **/node_modules/

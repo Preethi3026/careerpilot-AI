@@ -1,5 +1,9 @@
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 
+export function getDocumentUrl(path: string) {
+  return `${API_BASE_URL}${path}`;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
@@ -107,6 +111,10 @@ export function getWorkflowHistoryItem(id: number) {
   return request<{ id: number; created_at: string; result: Record<string, any> }>(`/api/workflow-history/${id}`);
 }
 
+export function getWorkflowRunStatus(idempotencyKey: string) {
+  return request<{ status: string; result: Record<string, any> | null; updated_at: string }>(`/api/workflow-runs/${encodeURIComponent(idempotencyKey)}`);
+}
+
 export function sendAgentChat(
   agentId: number,
   message: string,
@@ -158,12 +166,13 @@ export type CareerWorkflowEvent = {
 export async function streamCareerWorkflow(
   payload: CareerWorkflowPayload,
   onProgress: (event: CareerWorkflowEvent) => void,
+  idempotencyKey?: string,
 ) {
   let response: Response;
   try {
     response = await fetch(`${API_BASE_URL}/api/career-workflow/stream`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/x-ndjson" },
+      headers: { "Content-Type": "application/json", Accept: "application/x-ndjson", ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}) },
       body: JSON.stringify(payload),
     });
   } catch {

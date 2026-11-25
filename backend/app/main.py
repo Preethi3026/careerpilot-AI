@@ -1,11 +1,12 @@
 import json
 import os
+import uuid
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
-from starlette.responses import StreamingResponse
+from starlette.responses import FileResponse, StreamingResponse
 
 from app.core.llm import get_ai_response
 
@@ -25,6 +26,13 @@ from app.agents.application_manager import (
 )
 from app.agents.career_storage import (
     get_candidate_profile as load_candidate_profile,
+    get_generated_document,
+    attach_workflow_documents,
+    claim_workflow_run,
+    complete_workflow_run,
+    fail_workflow_run,
+    get_workflow_run,
+    fail_interrupted_workflow_runs,
     get_workflow_history,
     list_workflow_history,
     save_candidate_profile,
@@ -33,6 +41,10 @@ from app.agents.career_storage import (
 
 from app.agents.project_intelligence import recommend_projects
 from app.career_workflow import career_workflow_events, run_career_workflow as execute_career_workflow
+
+# The backend currently runs as a single local process. Any row left running
+# when that process starts belongs to a crashed or stopped prior execution.
+fail_interrupted_workflow_runs()
 
 
 # ============================================================
@@ -244,6 +256,16 @@ def read_workflow_history_item(workflow_id: int):
     if not history:
         raise HTTPException(status_code=404, detail="Workflow history entry not found")
     return history
+
+
+@app.get("/api/documents/{document_id}")
+def download_generated_document(document_id: str):
+    # The database maps opaque IDs to files inside generated_documents; callers
+    # never supply a filesystem path.
+    document = get_generated_document(document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Generated document not found")
+    return FileResponse(document["path"], media_type="application/pdf", filename=document["filename"])
 
 
 # ============================================================
@@ -697,16 +719,39 @@ def project_intelligence_endpoint(
 def run_career_workflow(request: CareerWorkflowRequest):
     result = execute_career_workflow(request.model_dump())
     result["history_id"] = save_workflow_result(result)
+    attach_workflow_documents(result["history_id"], result)
     return result
 
 
 @app.post("/api/career-workflow/stream")
-def stream_career_workflow(request: CareerWorkflowRequest):
+def stream_career_workflow(request: CareerWorkflowRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
     """Stream each actual workflow stage as newline-delimited JSON."""
+    run_key = (idempotency_key or uuid.uuid4().hex).strip()[:200]
+    run_state, cached_result = claim_workflow_run(run_key)
+    if run_state == "running":
+        raise HTTPException(status_code=409, detail="This workflow execution is already running.")
+    if run_state == "completed" and cached_result is not None:
+        event = {"type": "result", "data": cached_result}
+        return StreamingResponse(iter([json.dumps(event, ensure_ascii=False, default=str) + "\n"]), media_type="application/x-ndjson")
+
     def events():
-        for event in career_workflow_events(request.model_dump()):
-            if event.get("type") == "result" and isinstance(event.get("data"), dict):
-                event["data"]["history_id"] = save_workflow_result(event["data"])
-            yield json.dumps(event, ensure_ascii=False, default=str) + "\n"
+        try:
+            for event in career_workflow_events(request.model_dump()):
+                if event.get("type") == "result" and isinstance(event.get("data"), dict):
+                    event["data"]["history_id"] = save_workflow_result(event["data"])
+                    attach_workflow_documents(event["data"]["history_id"], event["data"])
+                    complete_workflow_run(run_key, event["data"])
+                yield json.dumps(event, ensure_ascii=False, default=str) + "\n"
+        except Exception:
+            fail_workflow_run(run_key)
+            raise
 
     return StreamingResponse(events(), media_type="application/x-ndjson")
+
+
+@app.get("/api/workflow-runs/{idempotency_key}")
+def workflow_run_status(idempotency_key: str):
+    run = get_workflow_run(idempotency_key)
+    if not run:
+        raise HTTPException(status_code=404, detail="Workflow execution was not found")
+    return run

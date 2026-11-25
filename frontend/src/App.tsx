@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
 import OfficeScene, { type OfficeAgent } from "./OfficeScene";
-import { callAgent as postAgent, checkBackend, createApplication, getApplications, getCandidateProfile, getWorkflowHistory, getWorkflowHistoryItem, saveCandidateProfile, sendAgentChat, streamCareerWorkflow, updateApplication, type CareerWorkflowEvent, type CareerWorkflowPayload, type SavedCandidateProfile } from "./services/api";
+import { callAgent as postAgent, checkBackend, createApplication, getApplications, getCandidateProfile, getDocumentUrl, getWorkflowHistory, getWorkflowHistoryItem, getWorkflowRunStatus, saveCandidateProfile, sendAgentChat, streamCareerWorkflow, updateApplication, type CareerWorkflowEvent, type CareerWorkflowPayload, type SavedCandidateProfile } from "./services/api";
 
 type Agent = {
   id: number;
@@ -36,9 +36,13 @@ type WorkflowJob = {
   match: Record<string, any>;
   resume?: string;
   resume_analysis?: Record<string, any>;
+  resume_document?: { id: string; filename: string; download_url: string };
   cover_letter?: string;
+  cover_letter_document?: { id: string; filename: string; download_url: string };
   company_research?: string;
   review?: string;
+  review_score?: number | null;
+  review_status?: string;
   tracking?: { status: string; applied: boolean; application?: Application | null };
   errors?: string[];
 };
@@ -54,8 +58,8 @@ type CareerWorkflowResult = {
 const agentWorkflowSteps: Record<number, string[]> = {
   1: ["Fetch job listings", "Remove duplicates", "Keep Germany or remote roles", "Check AI, data, and software fit", "Check junior and internship fit", "Score skills and rank results"],
   2: ["Read the job description", "Extract required skills", "Compare verified candidate skills", "Score education and experience", "Check level and role suitability", "Prepare match score and recommendation"],
-  3: ["Analyze the complete job description", "Verify resume skills and qualifications", "Prioritize relevant projects and experience", "Tailor the professional summary", "Reorder existing skills and bullets", "Return resume with gaps and verification notes"],
-  4: ["Read company, role, and job details", "Select relevant skills and projects", "Draft role-specific fit", "Add experience and motivation", "Assemble the letter and contact fields", "Return the cover letter"],
+  3: ["Analyze the job description", "Verify resume skills and qualifications", "Prioritize relevant projects and experience", "Tailor the professional summary", "Reorder existing skills and bullets", "Format the custom CV"],
+  4: ["Read company, role, and job details", "Select verified skills and projects", "Draft role-specific fit", "Write a custom cover letter", "Format the final letter"],
   5: ["Check resume and cover letter presence", "Find unreplaced placeholders", "Check email and profile links", "Verify project references", "Flag unsupported claims", "Summarize strengths and improvements"],
   6: ["Open the supplied official site", "Collect company information", "Detect industry and technologies", "Identify AI products and signals", "Check the target role context", "Compile the company research"],
   7: ["Load saved application records", "Group records by status", "Calculate application statistics", "Prepare the tracking summary"],
@@ -66,7 +70,7 @@ const agents: Agent[] = [
   { id: 1, name: "Job Hunter", role: "Finding internships", emoji: "🔎", desk: "01" },
   { id: 2, name: "Job Matcher", role: "Matching job skills", emoji: "🎯", desk: "02" },
   { id: 3, name: "Resume Agent", role: "Building resumes", emoji: "📄", desk: "03" },
-  { id: 4, name: "Cover Letter", role: "Writing applications", emoji: "✉️", desk: "04" },
+  { id: 4, name: "Cover Letter Agent", role: "Writing custom cover letters", emoji: "✉️", desk: "04" },
   { id: 5, name: "Application Reviewer", role: "Checking quality", emoji: "🔍", desk: "05" },
   { id: 6, name: "Company Researcher", role: "Researching companies", emoji: "🏢", desk: "06" },
   { id: 7, name: "Application Manager", role: "Tracking applications", emoji: "📋", desk: "07" },
@@ -226,7 +230,7 @@ const agentEndpoints: Record<number, string> = {
   8: "/api/project-recommendations",
 };
 
-const careerWorkflowOrder = [1, 2, 3, 6, 4, 5, 7, 8];
+const careerWorkflowOrder = [1, 2, 3, 4];
 
 function App() {
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null);
@@ -264,11 +268,13 @@ function App() {
   });
   const [resumeFileName, setResumeFileName] = useState("");
   const [resumeImportError, setResumeImportError] = useState("");
-  const [trackerMessages, setTrackerMessages] = useState<Record<string, string>>({});
   const [copiedDocument, setCopiedDocument] = useState("");
   const [profileSaveMessage, setProfileSaveMessage] = useState("");
   const [workflowHistory, setWorkflowHistory] = useState<{ id: number; created_at: string; keyword: string; summary: Record<string, number> }[]>([]);
   const [historyError, setHistoryError] = useState("");
+  const [profileLoaded, setProfileLoaded] = useState(false);
+  const savedProfileUpdatedAt = useRef<string | null>(null);
+  const autoStartClaimed = useRef(false);
 
   const [activity, setActivity] = useState<string[]>([
     "Office started successfully",
@@ -329,35 +335,67 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    void Promise.all([getCandidateProfile(), getWorkflowHistory()]).then(([saved, history]) => {
-      if (cancelled) return;
-      if (saved.profile) {
-        const profile = saved.profile;
-        setCareerForm((previous) => ({
-          ...previous,
-          resume_text: profile.resume_text || previous.resume_text,
-          skills: profile.skills || previous.skills,
-          education: profile.education || previous.education,
-          experience: profile.experience || previous.experience,
-          keyword: profile.preferred_job_titles || previous.keyword,
-          preferred_location: profile.preferred_location || previous.preferred_location,
-          job_type: profile.preferred_job_type || previous.job_type,
-          full_name: profile.full_name,
-          email: profile.email,
-          phone: profile.phone,
-          university: profile.university,
-          projects: profile.projects,
-          certifications: profile.certifications,
-          languages: profile.languages,
-          career_goals: profile.career_goals,
-        }));
+    const loadWhenReady = async () => {
+      while (!cancelled) {
+        try {
+          await checkBackend();
+          const [saved, history] = await Promise.all([getCandidateProfile(), getWorkflowHistory()]);
+          if (cancelled) return;
+          setBackendConnected(true);
+          if (saved.profile) {
+            const profile = saved.profile;
+            savedProfileUpdatedAt.current = saved.updated_at;
+            setCareerForm((previous) => ({
+              ...previous,
+              resume_text: profile.resume_text || previous.resume_text,
+              skills: profile.skills || previous.skills,
+              education: profile.education || previous.education,
+              experience: profile.experience || previous.experience,
+              keyword: profile.preferred_job_titles || previous.keyword,
+              preferred_location: profile.preferred_location || previous.preferred_location,
+              job_type: profile.preferred_job_type || previous.job_type,
+              full_name: profile.full_name,
+              email: profile.email,
+              phone: profile.phone,
+              university: profile.university,
+              projects: profile.projects,
+              certifications: profile.certifications,
+              languages: profile.languages,
+              career_goals: profile.career_goals,
+            }));
+          }
+          setWorkflowHistory(history.workflows);
+          setProfileLoaded(true);
+          if (!saved.profile) setCareerAssistantOpen(true);
+          return;
+        } catch {
+          if (!cancelled) setBackendConnected(false);
+          await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        }
       }
-      setWorkflowHistory(history.workflows);
-    }).catch((loadError) => {
-      if (!cancelled) setHistoryError(loadError instanceof Error ? loadError.message : "Could not load saved CareerPilot data.");
-    });
+    };
+    void loadWhenReady();
     return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    if (!backendConnected || !profileLoaded || !savedProfileUpdatedAt.current || autoStartClaimed.current) return;
+    if (careerForm.resume_text.trim().length < 40) {
+      setCareerAssistantOpen(true);
+      return;
+    }
+    const key = `careerpilot:auto-workflow:${savedProfileUpdatedAt.current}`;
+    const priorExecutionKey = localStorage.getItem(key);
+    if (priorExecutionKey) {
+      autoStartClaimed.current = true;
+      setCareerAssistantOpen(true);
+      void restoreAutomaticRun(priorExecutionKey === "started" ? `auto:${savedProfileUpdatedAt.current}` : priorExecutionKey, key);
+      return;
+    }
+    autoStartClaimed.current = true;
+    setCareerAssistantOpen(true);
+    void restoreOrStartAutomaticRun(savedProfileUpdatedAt.current, key);
+  }, [backendConnected, profileLoaded, careerForm.resume_text, workflowHistory]);
 
   useEffect(() => {
     let cancelled = false;
@@ -381,6 +419,69 @@ function App() {
     setActivity((previous) => [message, ...previous].slice(0, 5));
   }
 
+  async function restoreAutomaticRun(runKey: string, markerKey: string) {
+    for (let attempt = 0; attempt < 90; attempt++) {
+      try {
+        const run = await getWorkflowRunStatus(runKey);
+        if (run.status === "completed" && run.result) {
+          const resultData = run.result as CareerWorkflowResult;
+          const hasSourceErrors = Object.keys((resultData as any).source_errors || {}).length > 0;
+          const hasDocumentErrors = (resultData.errors || []).some((item) => item.agent === "Document Generator");
+          const retryKey = hasSourceErrors && Number(resultData.summary?.jobs_found || 0) === 0 && !runKey.includes(":retry:")
+            ? `${runKey}:retry:source-recovery`
+            : hasDocumentErrors && !runKey.includes(":pdf-recovery")
+              ? `${runKey.split(":retry:")[0]}:retry:pdf-recovery`
+              : "";
+          if (runKey.startsWith("auto:") && retryKey) {
+            localStorage.setItem(markerKey, retryKey);
+            void startCareerWorkflow(undefined, true, retryKey);
+            return;
+          }
+          setCareerResult(resultData);
+          setCareerProgress(Object.values((resultData as any).stages || {}).map((stage: any) => ({ type: "progress", agent_id: stage.agent_id, agent: agents.find((item) => item.id === stage.agent_id)?.name, status: stage.status, message: stage.message })));
+          for (const stage of Object.values((resultData as any).stages || {}) as any[]) {
+            setSceneStatus((previous) => ({ ...previous, [stage.agent_id]: stage.status }));
+          }
+          return;
+        }
+        if (run.status === "failed") {
+          localStorage.removeItem(markerKey);
+          autoStartClaimed.current = false;
+          void startCareerWorkflow(undefined, true);
+          return;
+        }
+      } catch (statusError) {
+        if (statusError instanceof Error && statusError.message.includes("Workflow execution was not found")) {
+          localStorage.removeItem(markerKey);
+          autoStartClaimed.current = false;
+          void startCareerWorkflow(undefined, true);
+          return;
+        }
+        // Backend may be restarting; keep checking the persisted run record.
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 2000));
+    }
+    setCareerError("The saved workflow is still running. This desk will restore its result when the backend finishes.");
+  }
+
+  async function restoreOrStartAutomaticRun(profileVersion: string, markerKey: string) {
+    const baseKey = `auto:${profileVersion}`;
+    // Find a persisted run from an earlier load before creating a fresh one.
+    // This also restores source/PDF recovery runs created by the startup path.
+    for (const runKey of [`${baseKey}:retry:pdf-recovery`, `${baseKey}:retry:source-recovery`, baseKey]) {
+      try {
+        await getWorkflowRunStatus(runKey);
+        localStorage.setItem(markerKey, runKey);
+        void restoreAutomaticRun(runKey, markerKey);
+        return;
+      } catch {
+        // Try the next known idempotency key; if none exist, launch the first run.
+      }
+    }
+    localStorage.setItem(markerKey, baseKey);
+    void startCareerWorkflow(undefined, true, baseKey);
+  }
+
   function getProfilePayload(form: CareerWorkflowPayload = careerForm): SavedCandidateProfile {
     return {
       full_name: form.full_name || "", email: form.email || "", phone: form.phone || "",
@@ -394,9 +495,18 @@ function App() {
 
   async function persistCandidateProfile() {
     try {
-      await saveCandidateProfile(getProfilePayload());
+      const saved = await saveCandidateProfile(getProfilePayload());
+      savedProfileUpdatedAt.current = saved.updated_at;
       setProfileSaveMessage("PROFILE SAVED");
       addActivity("Candidate profile saved for future analyses");
+      // Completing profile setup is the trigger for the first autonomous run.
+      if (!autoStartClaimed.current && saved.profile.resume_text.trim().length >= 40) {
+        const runKey = `auto:${saved.updated_at}`;
+        localStorage.setItem(`careerpilot:auto-workflow:${saved.updated_at}`, runKey);
+        autoStartClaimed.current = true;
+        setCareerAssistantOpen(true);
+        void startCareerWorkflow(undefined, true, runKey);
+      }
     } catch (saveError) {
       setProfileSaveMessage(saveError instanceof Error ? `PROFILE NOT SAVED · ${saveError.message}` : "PROFILE NOT SAVED");
     }
@@ -479,7 +589,6 @@ function App() {
     setCareerError("");
     setCareerProgress([]);
     setCareerResult(null);
-    setTrackerMessages({});
     setResumeFileName("");
     setResumeImportError("");
     for (const id of careerWorkflowOrder) {
@@ -489,24 +598,32 @@ function App() {
     }
   }
 
-  async function startCareerWorkflow(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function startCareerWorkflow(event?: React.FormEvent<HTMLFormElement>, automatic = false, suppliedExecutionKey?: string) {
+    event?.preventDefault();
     if (careerLoading) return;
     if (careerForm.resume_text.trim().length < 40) {
-      setCareerError("Paste at least a short resume or candidate profile so the team can match jobs accurately.");
+      setCareerError("Complete your saved candidate profile before starting an automated search.");
       return;
     }
+    if (automatic) addActivity("Saved candidate profile loaded; automatic job discovery started");
+    const executionKey = suppliedExecutionKey || (automatic
+      ? `auto:${savedProfileUpdatedAt.current}`
+      : `manual:${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`}`);
     setCareerLoading(true);
     setCareerError("");
     setCareerProgress([]);
     setCareerResult(null);
-    setTrackerMessages({});
     try {
-      try {
-        await saveCandidateProfile(getProfilePayload());
-        setProfileSaveMessage("PROFILE SAVED");
-      } catch (saveError) {
-        setProfileSaveMessage(saveError instanceof Error ? `PROFILE SAVE FAILED · ${saveError.message}` : "PROFILE SAVE FAILED");
+      if (!automatic) {
+        try {
+          const saved = await saveCandidateProfile(getProfilePayload());
+          savedProfileUpdatedAt.current = saved.updated_at;
+          localStorage.setItem(`careerpilot:auto-workflow:${saved.updated_at}`, executionKey);
+          autoStartClaimed.current = true;
+          setProfileSaveMessage("PROFILE SAVED");
+        } catch (saveError) {
+          setProfileSaveMessage(saveError instanceof Error ? `PROFILE SAVE FAILED · ${saveError.message}` : "PROFILE SAVE FAILED");
+        }
       }
       const result = await streamCareerWorkflow(careerForm, (update) => {
         setCareerProgress((previous) => [...previous, update]);
@@ -520,7 +637,7 @@ function App() {
           if (status === "working") setSceneProgress((previous) => ({ ...previous, [update.agent_id!]: 0 }));
         }
         if (update.message) addActivity(`${update.agent}: ${update.message}`);
-      });
+      }, executionKey);
       setCareerResult(result as CareerWorkflowResult);
       try {
         const savedHistory = await getWorkflowHistory();
@@ -600,31 +717,6 @@ function App() {
       window.setTimeout(() => setCopiedDocument(""), 1800);
     } catch {
       setCareerError("Clipboard access was unavailable. Select and copy the document text manually.");
-    }
-  }
-
-  async function saveWorkflowJob(item: WorkflowJob) {
-    const job = item.job;
-    const key = String(job.url || `${job.company}-${job.title}`);
-    if (trackerMessages[key]) return;
-    try {
-      const response = await createApplication({
-        company: String(job.company || "Company not specified"),
-        role: String(job.title || "Role not specified"),
-        job_url: String(job.url || ""),
-        status: "Documents Prepared",
-        location: String(job.location || ""),
-        source: String(job.source || ""),
-        match_score: Number(item.match.match_score || 0),
-        resume: item.resume || "",
-        cover_letter: item.cover_letter || "",
-      });
-      const app = (response as any).application;
-      const message = app?.duplicate ? "Already in tracker" : "Saved to tracker";
-      setTrackerMessages((previous) => ({ ...previous, [key]: message }));
-      addActivity(`${job.company || "Opportunity"} ${message.toLowerCase()}`);
-    } catch (error) {
-      setTrackerMessages((previous) => ({ ...previous, [key]: error instanceof Error ? error.message : "Could not save" }));
     }
   }
 
@@ -968,7 +1060,7 @@ function App() {
             </header>
 
             {!careerLoading && !careerResult && (
-              <form className="career-intake" onSubmit={startCareerWorkflow}>
+              <form className="career-intake" onSubmit={(event) => void startCareerWorkflow(event)}>
                 <div className="career-intake-grid">
                   <div className="career-resume-field">
                     <div className="career-resume-head">
@@ -1070,9 +1162,11 @@ function App() {
                   <div><strong>{careerResult.summary.suitable_jobs ?? careerResult.summary.selected_jobs ?? 0}</strong><span>Suitable jobs</span></div>
                   <div><strong>{careerResult.summary.unsuitable_jobs || 0}</strong><span>Unsuitable jobs</span></div>
                   <div><strong>{careerResult.summary.documents_completed || 0}</strong><span>Packages prepared</span></div>
+                  <div><strong>{careerResult.summary.pdfs_generated || 0}</strong><span>PDFs generated</span></div>
                   <div><strong>{careerResult.summary.failed_tasks || 0}</strong><span>Failed agents</span></div>
                   <div><strong>{careerResult.summary.skipped_tasks || 0}</strong><span>Skipped agents</span></div>
                 </div>
+                <p className="career-threshold-note"><strong>Acceptance rule:</strong> jobs are accepted at a Job Match score of 80% or higher. The Application Review score is a separate document quality check and does not change job acceptance.</p>
 
                 <details className="career-section">
                   <summary>Job opportunities found <b>{careerResult.jobs_found.length}</b></summary>
@@ -1086,30 +1180,22 @@ function App() {
                   <h4>Selected opportunities and application packages <span>{careerResult.selected_jobs.length}</span></h4>
                   {careerResult.selected_jobs.map((item, index) => {
                     const job = item.job;
-                    const trackingKey = String(job.url || `${job.company}-${job.title}`);
-                    return <article className="career-job-package" key={`${trackingKey}-${index}`}>
-                      <header><div><small>RECOMMENDED MATCH · {Number(item.match.match_score || 0)}%</small><h5>{job.title}</h5><p>{job.company} · {job.location || "Location not specified"} · {job.source || "Job source not specified"}</p></div><button type="button" onClick={() => void saveWorkflowJob(item)} disabled={Boolean(trackerMessages[trackingKey])}>{trackerMessages[trackingKey] || (item.tracking?.status === "Already tracked" ? "Already tracked" : "SAVE TO TRACKER")}</button></header>
+                    return <article className="career-job-package" key={`${job.url || `${job.company}-${job.title}`}-${index}`}>
+                      <header><div><small>RECOMMENDED MATCH · {Number(item.match.match_score || 0)}%</small><h5>{job.title}</h5><p>{job.company} · {job.location || "Location not specified"} · {job.source || "Job source not specified"}</p></div></header>
                       <p><strong>Recommendation:</strong> {item.match.recommendation || "Review this opportunity"}</p>
+                      <details className="career-document"><summary>Job description</summary><pre>{job.description || "The listing did not provide a full description."}</pre></details>
                       <p><strong>Skills match:</strong> {(item.match.matched_skills || []).join(", ") || "No matching skills identified"}</p>
                       <p><strong>Skills to address:</strong> {(item.match.missing_skills || []).join(", ") || "No additional skill gaps identified"}</p>
                       <p><strong>Education:</strong> {item.match.education_match ? "Match identified" : "Review education requirements"} · <strong>Experience:</strong> {item.match.experience_match ? "Relevant experience identified" : "Review experience requirements"}</p>
                       {job.url && <a className="career-listing-link" href={job.url} target="_blank" rel="noreferrer">OPEN ORIGINAL LISTING ↗</a>}
-                      {item.resume && <details className="career-document"><summary>Tailored resume</summary><div className="career-document-actions"><button type="button" onClick={() => void copyCareerDocument(`resume-${index}`, item.resume!)}>{copiedDocument === `resume-${index}` ? "COPIED" : "COPY RESUME"}</button><button type="button" onClick={() => downloadCareerDocument(`${job.company}-${job.title}-resume`, item.resume!)}>DOWNLOAD .TXT</button><button type="button" onClick={() => printCareerDocument(`${job.company} - ${job.title} Resume`, item.resume!)}>PRINT / SAVE PDF</button></div><pre>{item.resume}</pre>{item.resume_analysis && <details className="career-document-analysis"><summary>Resume tailoring details</summary><p><strong>Target:</strong> {item.resume_analysis.target_job?.title} · {item.resume_analysis.target_job?.company}</p><p><strong>Matched verified skills:</strong> {(item.resume_analysis.relevant_skills_matched || []).join(", ") || "None detected"}</p><p><strong>Missing skills:</strong> {(item.resume_analysis.missing_skills || []).join(", ") || "None detected"}</p><p><strong>Changes made:</strong></p><ul>{(item.resume_analysis.changes_made || []).map((change: string) => <li key={change}>{change}</li>)}</ul><p><strong>Candidate verification:</strong></p><ul>{(item.resume_analysis.information_needing_candidate_verification || []).map((note: string) => <li key={note}>{note}</li>)}</ul></details>}</details>}
-                      {item.cover_letter && <details className="career-document"><summary>Customized cover letter</summary><div className="career-document-actions"><button type="button" onClick={() => void copyCareerDocument(`letter-${index}`, item.cover_letter!)}>{copiedDocument === `letter-${index}` ? "COPIED" : "COPY COVER LETTER"}</button><button type="button" onClick={() => downloadCareerDocument(`${job.company}-${job.title}-cover-letter`, item.cover_letter!)}>DOWNLOAD .TXT</button><button type="button" onClick={() => printCareerDocument(`${job.company} - ${job.title} Cover Letter`, item.cover_letter!)}>PRINT / SAVE PDF</button></div><pre>{item.cover_letter}</pre></details>}
-                      {item.company_research && <details className="career-document"><summary>Company research and interview preparation</summary>{job.company_url && <p><a href={job.company_url} target="_blank" rel="noreferrer">Open supplied official website ↗</a></p>}<pre>{item.company_research}</pre></details>}
-                      {item.review && <details className="career-document"><summary>Resume and cover letter review</summary><pre>{item.review}</pre></details>}
+                      {item.resume && <details className="career-document"><summary>Tailored resume</summary><div className="career-document-actions"><button type="button" onClick={() => void copyCareerDocument(`resume-${index}`, item.resume!)}>{copiedDocument === `resume-${index}` ? "COPIED" : "COPY RESUME"}</button>{item.resume_document && <a className="career-download-link" href={getDocumentUrl(item.resume_document.download_url)} download={item.resume_document.filename}>DOWNLOAD RESUME PDF</a>}<button type="button" onClick={() => downloadCareerDocument(`${job.company}-${job.title}-resume`, item.resume!)}>DOWNLOAD .TXT</button><button type="button" onClick={() => printCareerDocument(`${job.company} - ${job.title} Resume`, item.resume!)}>PRINT</button></div><pre>{item.resume}</pre>{item.resume_analysis && <details className="career-document-analysis"><summary>Resume tailoring details</summary><p><strong>Target:</strong> {item.resume_analysis.target_job?.title} · {item.resume_analysis.target_job?.company}</p><p><strong>Matched verified skills:</strong> {(item.resume_analysis.relevant_skills_matched || []).join(", ") || "None detected"}</p><p><strong>Missing skills:</strong> {(item.resume_analysis.missing_skills || []).join(", ") || "None detected"}</p><p><strong>Changes made:</strong></p><ul>{(item.resume_analysis.changes_made || []).map((change: string) => <li key={change}>{change}</li>)}</ul><p><strong>Candidate verification:</strong></p><ul>{(item.resume_analysis.information_needing_candidate_verification || []).map((note: string) => <li key={note}>{note}</li>)}</ul></details>}</details>}
+                      {item.cover_letter && <details className="career-document"><summary>Customized cover letter</summary><div className="career-document-actions"><button type="button" onClick={() => void copyCareerDocument(`letter-${index}`, item.cover_letter!)}>{copiedDocument === `letter-${index}` ? "COPIED" : "COPY COVER LETTER"}</button>{item.cover_letter_document && <a className="career-download-link" href={getDocumentUrl(item.cover_letter_document.download_url)} download={item.cover_letter_document.filename}>DOWNLOAD COVER LETTER PDF</a>}<button type="button" onClick={() => downloadCareerDocument(`${job.company}-${job.title}-cover-letter`, item.cover_letter!)}>DOWNLOAD .TXT</button><button type="button" onClick={() => printCareerDocument(`${job.company} - ${job.title} Cover Letter`, item.cover_letter!)}>PRINT</button></div><pre>{item.cover_letter}</pre></details>}
                       {item.errors?.map((message) => <p className="career-inline-error" key={message}>{message}</p>)}
                     </article>;
                   })}
                   {careerResult.selected_jobs.length === 0 && <p>No jobs passed the suitability threshold, so document generation was skipped.</p>}
                 </section>
 
-                <details className="career-section">
-                  <summary>Application tracking <b>{careerResult.application_tracking?.statistics?.total_applications ?? 0} existing records</b></summary>
-                  <p>Workflow review does not mark opportunities as applied. Use “Save to tracker” on a selected job to add it as Saved. Existing job URLs are deduplicated.</p>
-                </details>
-
-                {careerResult.project_intelligence && <details className="career-section"><summary>Project Intelligence · skill and portfolio recommendations</summary><pre>{JSON.stringify(careerResult.project_intelligence, null, 2)}</pre></details>}
                 {careerResult.errors.length > 0 && <details className="career-section career-error-section" open><summary>Agent errors and source limitations <b>{careerResult.errors.length}</b></summary>{careerResult.errors.map((item, index) => <p key={`${item.agent}-${index}`}><strong>{item.agent}:</strong> {item.message}</p>)}</details>}
                 {(careerResult as any).source_errors && Object.keys((careerResult as any).source_errors).length > 0 && <details className="career-section" open><summary>Job source status</summary><pre>{JSON.stringify((careerResult as any).source_errors, null, 2)}</pre></details>}
               </section>

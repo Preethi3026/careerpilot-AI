@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 from typing import Any
 
-from app.agents.application_manager import get_applications, get_application_stats
-from app.agents.application_reviewer import review_application
-from app.agents.company_researcher import research_company
+from app.agents.career_storage import create_document_pdf
 from app.agents.cover_letter_agent import generate_cover_letter
 from app.agents.job_hunter import search_jobs
 from app.agents.job_matcher import SKILL_ALIASES, contains_skill, match_job
-from app.agents.project_intelligence import CANDIDATE_PROFILE as PROJECT_CANDIDATE_PROFILE, recommend_projects
+from app.agents.project_intelligence import CANDIDATE_PROFILE as PROJECT_CANDIDATE_PROFILE
 from app.agents.remote_job_hunter import search_remote_jobs
 from app.agents.resume_agent import create_resume_package
 
@@ -20,11 +20,7 @@ STAGES = [
     (1, "Job Hunter"),
     (2, "Job Matcher"),
     (3, "Resume Agent"),
-    (6, "Company Researcher"),
-    (4, "Cover Letter"),
-    (5, "Application Reviewer"),
-    (7, "Application Manager"),
-    (8, "Project Intelligence"),
+    (4, "Cover Letter Agent"),
 ]
 
 EARLY_CAREER_TERMS = (
@@ -50,10 +46,9 @@ def _candidate_profile(request: dict[str, Any]) -> dict[str, Any]:
     ]
 
     years = 0
-    if experience:
-        import re
-        match = re.search(r"(\d+)\+?\s+years?", experience, re.IGNORECASE)
-        years = int(match.group(1)) if match else 0
+    experience_evidence = experience or resume
+    match = re.search(r"(\d+)\+?\s+years?", experience_evidence, re.IGNORECASE)
+    years = int(match.group(1)) if match else 0
 
     return {
         "skills": skills,
@@ -114,28 +109,16 @@ def _matches_job_type(job: dict[str, Any], requested_type: str) -> bool:
 
 
 def _is_suitable(job: dict[str, Any], match: dict[str, Any], requested_type: str) -> bool:
-    if match.get("seniority_mismatch") or match.get("match_score", 0) < 50:
-        return False
-    level = str(match.get("job_level", "")).lower()
-    early_career = bool(match.get("internship_suitable")) or level == "junior"
-    explicit_early_career = any(term in _job_text(job).lower() for term in EARLY_CAREER_TERMS)
-    type_is_early_career = requested_type.lower() in {"internship", "working student", "junior"}
-    return early_career or explicit_early_career or not type_is_early_career
+    # This is the single acceptance rule used throughout the Job Desk.
+    return float(match.get("match_score", 0) or 0) >= 80
 
 
 def _rejection_reasons(job: dict[str, Any], match: dict[str, Any], requested_type: str) -> list[str]:
     reasons: list[str] = []
     score = match.get("match_score", 0)
-    if match.get("seniority_mismatch"):
-        reasons.append(f"{match.get('job_level', 'Senior')} seniority does not fit the requested early-career target.")
-    if score < 50:
-        reasons.append(f"Match score ({score}%) is below the 50% selection threshold.")
-    level = str(match.get("job_level", "")).lower()
-    early_career = bool(match.get("internship_suitable")) or level == "junior"
-    explicit_early_career = any(term in _job_text(job).lower() for term in EARLY_CAREER_TERMS)
-    if (requested_type or "internship").strip().lower() in {"internship", "working student", "junior"} and not (early_career or explicit_early_career):
-        reasons.append("The listing does not identify itself as an internship, student, junior, or entry-level role.")
-    return reasons or ["The listing did not pass the configured suitability checks."]
+    if float(score or 0) < 80:
+        reasons.append(f"Match score ({score}%) is below the required 80% acceptance threshold.")
+    return reasons or ["The listing did not pass the required 80% match threshold."]
 
 
 def _emit(agent_id: int, status: str, message: str, **extra: Any) -> dict[str, Any]:
@@ -239,165 +222,89 @@ def career_workflow_events(request: dict[str, Any]) -> Iterator[dict[str, Any]]:
     for job in matched_jobs:
         job["suitable"] = _is_suitable(job, job["match"], requested_type)
         job["rejection_reasons"] = [] if job["suitable"] else _rejection_reasons(job, job["match"], requested_type)
-    suitable_jobs = [job for job in matched_jobs if job["suitable"]][:limit]
+    suitable_jobs = [job for job in matched_jobs if job["suitable"]]
     yield status(2, "completed", f"Selected {len(suitable_jobs)} suitable listing(s)", selected_count=len(suitable_jobs))
 
-    # Every later agent receives the selected listing, and the document agents
-    # receive the actual user's resume plus the output from the previous stage.
+    # The Hunter is the only trigger. The Matcher passes accepted listings to both
+    # document agents, which work concurrently from the same verified source CV.
     selected: list[dict[str, Any]] = [
         {"job": job, "match": job["match"]} for job in suitable_jobs
     ]
     if not suitable_jobs:
-        for agent_id in (3, 6, 4, 5):
-            yield status(agent_id, "skipped", "No suitable job was selected")
-            stages[dict(STAGES)[agent_id]]["status"] = "skipped"
+        for agent_id in (3, 4):
+            yield status(agent_id, "skipped", "No job reached the 80% match threshold")
 
-    # STEP 3: Tailor a separate resume for each selected job.
     if suitable_jobs:
         yield status(3, "working", f"Tailoring resumes for {len(suitable_jobs)} selected job(s)")
-        resume_failures = 0
-        for item in selected:
-            job = item["job"]
-            try:
-                package = create_resume_package(
-                    job_description=_job_text(job),
-                    resume_text=candidate["resume_text"],
-                    candidate_skills=candidate["skills"],
-                    candidate_education=candidate["education_provided"],
-                    candidate_experience=candidate["experience_provided"],
-                    candidate_projects="\n".join(candidate["projects"]),
-                    candidate_name=candidate["full_name"],
-                    candidate_email=candidate["email"],
-                    candidate_phone=candidate["phone"],
-                    candidate_certifications=candidate["certifications"],
-                    candidate_languages=candidate["languages"],
-                    job_title=str(job.get("title", "")),
-                    company=str(job.get("company", "")),
-                )
-                item["resume"] = package["tailored_resume"]
-                item["resume_analysis"] = {
-                    key: value for key, value in package.items() if key != "tailored_resume"
-                }
-            except Exception as error:
-                resume_failures += 1
-                item["errors"] = [f"Resume Agent: {error}"]
-                errors.append({"agent": "Resume Agent", "message": f"{job.get('company')} · {job.get('title')}: {error}"})
-        yield status(3, "failed" if resume_failures else "completed",
-                     f"Resume tailoring failed for {resume_failures} job(s)" if resume_failures else "Resume tailoring finished",
-                     failed_count=resume_failures)
+        yield status(4, "working", f"Writing cover letters for {len(suitable_jobs)} selected job(s)")
+        failures = {"resume": 0, "cover_letter": 0}
 
-        # STEP 4: Research first so grounded company context is available to
-        # the Cover Letter Agent. Never guess a company URL.
-        yield status(6, "working", "Collecting verifiable company information")
-        research_failures = 0
-        for item in selected:
+        def make_resume(item: dict[str, Any]) -> dict[str, Any]:
             job = item["job"]
-            company_url = str(job.get("company_url", "") or "")
-            if not company_url and len(selected) == 1:
-                company_url = str(request.get("company_url", "") or "")
-            try:
-                item["company_research"] = research_company(
-                    str(job.get("company", "Company not specified")),
-                    str(job.get("title", "Role not specified")),
-                    company_url,
-                )
-            except Exception as error:
-                research_failures += 1
-                item.setdefault("errors", []).append(f"Company Researcher: {error}")
-                errors.append({"agent": "Company Researcher", "message": f"{job.get('company')}: {error}"})
-        yield status(6, "failed" if research_failures else "completed",
-                     f"Company research failed for {research_failures} job(s)" if research_failures else "Company research finished with source limitations noted",
-                     failed_count=research_failures)
+            return create_resume_package(
+                job_description=_job_text(job), resume_text=candidate["resume_text"],
+                candidate_skills=candidate["skills"], candidate_education=candidate["education_provided"],
+                candidate_experience=candidate["experience_provided"], candidate_projects="\n".join(candidate["projects"]),
+                candidate_name=candidate["full_name"], candidate_email=candidate["email"], candidate_phone=candidate["phone"],
+                candidate_certifications=candidate["certifications"], candidate_languages=candidate["languages"],
+                job_title=str(job.get("title", "")), company=str(job.get("company", "")),
+            )
 
-        # STEP 5: Cover letters receive the tailored resume and company report.
-        cover_letter_jobs = [item for item in selected if item.get("resume")]
-        if not cover_letter_jobs:
-            yield status(4, "skipped", "No tailored resume was available")
-        else:
-            yield status(4, "working", "Writing job-specific cover letters using resume and company context")
-            cover_letter_failures = 0
-            for item in cover_letter_jobs:
+        def make_cover_letter(item: dict[str, Any]) -> str:
+            job = item["job"]
+            return generate_cover_letter(
+                _job_text(job), str(job.get("company", "Company not specified")),
+                str(job.get("title", "Role not specified")), candidate["resume_text"],
+                candidate_name=candidate["full_name"],
+            )
+
+        tasks = {}
+        with ThreadPoolExecutor(max_workers=min(8, max(2, len(selected) * 2))) as pool:
+            for item in selected:
+                tasks[pool.submit(make_resume, item)] = ("resume", item)
+                tasks[pool.submit(make_cover_letter, item)] = ("cover_letter", item)
+            for future in as_completed(tasks):
+                task, item = tasks[future]
                 job = item["job"]
                 try:
-                    item["cover_letter"] = generate_cover_letter(
-                        _job_text(job),
-                        str(job.get("company", "Company not specified")),
-                        str(job.get("title", "Role not specified")),
-                        item["resume"],
-                        item.get("company_research", ""),
-                        candidate["full_name"],
-                    )
+                    output = future.result()
+                    if task == "resume":
+                        item["resume"] = output["tailored_resume"]
+                        item["resume_analysis"] = {key: value for key, value in output.items() if key != "tailored_resume"}
+                    else:
+                        item["cover_letter"] = output
                 except Exception as error:
-                    cover_letter_failures += 1
-                    item.setdefault("errors", []).append(f"Cover Letter: {error}")
-                    errors.append({"agent": "Cover Letter", "message": f"{job.get('company')} · {job.get('title')}: {error}"})
-            yield status(4, "failed" if cover_letter_failures else "completed",
-                         f"Cover letter generation failed for {cover_letter_failures} job(s)" if cover_letter_failures else "Cover letter generation finished",
-                         failed_count=cover_letter_failures)
+                    failures[task] += 1
+                    agent_name = "Resume Agent" if task == "resume" else "Cover Letter Agent"
+                    item.setdefault("errors", []).append(f"{agent_name}: {error}")
+                    errors.append({"agent": agent_name, "message": f"{job.get('company')} ? {job.get('title')}: {error}"})
 
-        # STEP 6: Review the exact tailored documents before delivery.
-        review_jobs = [item for item in selected if item.get("resume") and item.get("cover_letter")]
-        if not review_jobs:
-            yield status(5, "skipped", "No complete resume and cover letter pair was available")
-        else:
-            yield status(5, "working", "Reviewing tailored documents for fit and consistency")
-            review_failures = 0
-            for item in review_jobs:
-                job = item["job"]
-                try:
-                    item["review"] = review_application(
-                        _job_text(job), item["resume"], item["cover_letter"], item.get("company_research", "")
-                    )
-                except Exception as error:
-                    review_failures += 1
-                    item.setdefault("errors", []).append(f"Application Reviewer: {error}")
-                    errors.append({"agent": "Application Reviewer", "message": f"{job.get('company')} · {job.get('title')}: {error}"})
-            yield status(5, "failed" if review_failures else "completed",
-                         f"Document review failed for {review_failures} job(s)" if review_failures else "Document review finished",
-                         failed_count=review_failures)
+        for agent_id, task, label in ((3, "resume", "Resume Agent"), (4, "cover_letter", "Cover Letter Agent")):
+            count = failures[task]
+            yield status(agent_id, "failed" if count else "completed",
+                         f"{label} failed for {count} job(s)" if count else f"{label} finished",
+                         failed_count=count)
 
-    # STEP 7: Match existing tracking records. Do not mark jobs as applied or
-    # write new records until the user explicitly saves an opportunity.
-    yield status(7, "working", "Checking the application tracker without changing records")
-    try:
-        applications = get_applications()
-        statistics = get_application_stats()
-        for item in selected:
-            job = item["job"]
-            job_url = str(job.get("url", "") or "")
-            existing = next((
-                app for app in applications
-                if (job_url and app.get("job_url") == job_url)
-                or (str(app.get("company", "")).casefold() == str(job.get("company", "")).casefold()
-                    and str(app.get("role", "")).casefold() == str(job.get("title", "")).casefold())
-            ), None)
-            item["tracking"] = {
-                "status": "Already tracked" if existing else "Ready to save",
-                "application": existing,
-                "applied": bool(existing and existing.get("status") not in {"Saved", "Interested"}),
-            }
-        yield status(7, "completed", "Tracker checked; no records were changed")
-    except Exception as error:
-        applications = []
-        statistics = {}
-        errors.append({"agent": "Application Manager", "message": str(error)})
-        yield status(7, "failed", "Could not read the application tracker", error=str(error))
-
-    # STEP 8: Recommend portfolio improvements from selected jobs, or from the
-    # user's target query when no suitable opportunity was found.
-    yield status(8, "working", "Mapping portfolio work to skill gaps")
-    project_text = "\n\n".join(_job_text(item["job"]) for item in selected) or keywords
-    try:
-        project_analysis = recommend_projects(
-            project_text,
-            candidate_skills=candidate["skills"],
-            candidate_projects=candidate["projects"],
-        )
-        yield status(8, "completed", "Project and skill recommendations are ready")
-    except Exception as error:
-        project_analysis = None
-        errors.append({"agent": "Project Intelligence", "message": str(error)})
-        yield status(8, "failed", "Project recommendations could not be generated", error=str(error))
+    # Save actual, paginated PDFs locally only for accepted jobs with both
+    # generated documents. Their opaque IDs are the only download handles sent
+    # to the frontend.
+    pdf_failures = 0
+    for item in selected:
+        job = item["job"]
+        for key, content, kind in (
+            ("resume_document", item.get("resume"), "resume"),
+            ("cover_letter_document", item.get("cover_letter"), "cover_letter"),
+        ):
+            if not content:
+                continue
+            try:
+                item[key] = create_document_pdf(content, str(job.get("title", "Role")), str(job.get("company", "Company")), kind)
+            except Exception as error:
+                pdf_failures += 1
+                item.setdefault("errors", []).append(f"PDF generation: {error}")
+                errors.append({"agent": "Document Generator", "message": f"{job.get('company')} ? {job.get('title')}: {error}"})
+    if pdf_failures:
+        stages["Resume Agent"]["message"] += f"; PDF output failed for {pdf_failures} document(s)"
 
     result = {
         "agent": "CareerPilot AI Career Assistant",
@@ -419,12 +326,6 @@ def career_workflow_events(request: dict[str, Any]) -> Iterator[dict[str, Any]]:
             for name, result in provider_results
         },
         "source_errors": source_errors,
-        "application_tracking": {
-            "statistics": statistics,
-            "records": applications,
-            "records_changed": False,
-        },
-        "project_intelligence": project_analysis,
         "stages": stages,
         "errors": errors,
         "summary": {
@@ -434,9 +335,9 @@ def career_workflow_events(request: dict[str, Any]) -> Iterator[dict[str, Any]]:
             "suitable_jobs": len(selected),
             "unsuitable_jobs": len([job for job in matched_jobs if not job["suitable"]]),
             "documents_completed": sum(1 for item in selected if item.get("resume") and item.get("cover_letter")),
+            "pdfs_generated": sum(int(bool(item.get("resume_document"))) + int(bool(item.get("cover_letter_document"))) for item in selected),
             "failed_tasks": sum(1 for stage in stages.values() if stage["status"] == "failed"),
             "skipped_tasks": sum(1 for stage in stages.values() if stage["status"] == "skipped"),
-            "applications_saved": 0,
         },
     }
     yield {"type": "result", "data": result}

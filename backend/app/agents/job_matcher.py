@@ -115,7 +115,12 @@ SKILL_ALIASES = {
     "Linux": ["linux"],
     "Spark": ["apache spark", "pyspark", "spark"],
     "Hugging Face": ["hugging face", "huggingface"],
-    "Scikit-learn": ["scikit-learn", "sklearn"]
+    "Scikit-learn": ["scikit-learn", "scikit learn", "sklearn"],
+    "Pandas": ["pandas"],
+    "NumPy": ["numpy"],
+    "Natural Language Processing": ["natural language processing", "nlp"],
+    "Computer Vision": ["computer vision"],
+    "Excel": ["excel", "microsoft excel"]
 }
 
 
@@ -545,16 +550,6 @@ def match_job(
     # --------------------------------------------------------
 
     final_score = skill_score
-
-    # Limited evidence adjustment
-
-    if len(required_skills) < 5:
-
-        final_score = min(final_score, 50)
-
-    elif len(required_skills) < 8:
-
-        final_score = min(final_score, 70)
 
     # Education contribution
 
